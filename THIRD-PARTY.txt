@@ -1,0 +1,16 @@
+ACNHRecomp release packages carry these libraries, unmodified, under their own licences:
+
+SDL3 (zlib licence); the Microsoft Visual C++ runtime (vcruntime140, msvcp140: redistributable).
+
+SDL3: https://github.com/libsdl-org/SDL (zlib). Vulkan loader: https://github.com/KhronosGroup/Vulkan-Loader
+(Apache 2.0). MoltenVK: https://github.com/KhronosGroup/MoltenVK (Apache 2.0). libvpx: https://chromium.googlesource.com/webm/libvpx
+(BSD 3-clause). libvorbis and libogg: https://xiph.org (BSD 3-clause). Dear ImGui (in the launcher and the
+settings screen): https://github.com/ocornut/imgui (MIT).
+
+Portable catalog builder components:
+Python 3.12.9 (PSF license and bundled third-party notices in licenses/Python.txt).
+python-zstandard 0.25.0 (BSD; licenses/python-zstandard.txt).
+Zstandard 1.5.7 (BSD; licenses/Zstandard.txt).
+PyInstaller 6.22.3 bootloader (GPL with special distribution exception; licenses/PyInstaller.txt).
+OpenSSL 3.x in the bundled Python runtime (Apache 2.0; licenses/OpenSSL.txt).
+Trainer additions copyright 2026 matt090-0, MIT. Developed with AI assistance from OpenAI Codex (GPT-6).
