@@ -1,0 +1,496 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 51a54cd..d5849fe 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -476,6 +476,10 @@ if(EXISTS "${NX_IMGUI_DIR}/imgui.cpp")
+         ${NX_IMGUI_DIR}/imgui_widgets.cpp ${NX_IMGUI_DIR}/backends/imgui_impl_vulkan.cpp)
+     target_include_directories(${NX_GAME} PRIVATE ${NX_IMGUI_DIR})
+     target_compile_definitions(${NX_GAME} PRIVATE IMGUI_IMPL_VULKAN_NO_PROTOTYPES $<$<NOT:$<BOOL:${ANDROID}>>:NX_HAVE_SDL3>)
++    option(NX_BELLS_TEST_BRIDGE "Local test-only driver for the Bells menu" OFF)
++    if(NX_BELLS_TEST_BRIDGE)
++        set_source_files_properties(runtime/src/ui/ui.cpp PROPERTIES COMPILE_DEFINITIONS NX_BELLS_TEST_BRIDGE)
++    endif()
+ else()
+     message(STATUS "Dear ImGui not found in ${NX_IMGUI_DIR}: no settings screen")
+     target_sources(${NX_GAME} PRIVATE runtime/src/ui/ui_stub.cpp)
+diff --git a/runtime/src/hle_hid.cpp b/runtime/src/hle_hid.cpp
+index f2318fd..d6ffdb8 100644
+--- a/runtime/src/hle_hid.cpp
++++ b/runtime/src/hle_hid.cpp
+@@ -18,6 +18,8 @@
+ 
+ #include "config.h"
+ #include "platform.h"
++#include "bells_menu.h"
++#include "visitor_menu.h"
+ 
+ namespace nx {
+ 
+@@ -131,6 +133,8 @@ void stick_buttons(PadState& p) {
+ }
+ 
+ PadState read() {
++    bells::process_pending();
++    visitors::process_pending();
+     PadState p;
+     std::lock_guard lk(g_script_lock);
+     std::vector<Scripted>& script = nx::script();
+diff --git a/runtime/src/loader.cpp b/runtime/src/loader.cpp
+index 1dac405..d8082cd 100644
+--- a/runtime/src/loader.cpp
++++ b/runtime/src/loader.cpp
+@@ -9,6 +9,7 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <fstream>
++#include <filesystem>
+ #include <mutex>
+ #include <thread>
+ #include <string>
+@@ -514,7 +515,7 @@ void load_modules(const ModuleInfo* const* mods, size_t count, const std::string
+         uint64_t size = ((mi->bss + mi->bss_size) + 0xFFF) & ~0xFFFull;
+         if (!commit(mi->base, size)) fatal("cannot commit module %s", mi->name);
+         std::string path = data_dir + "/" + mi->name + ".bin";
+-        std::ifstream f(path, std::ios::binary);
++        std::ifstream f(std::filesystem::u8path(path), std::ios::binary);
+         if (!f) fatal("missing %s (run tools/nso2bin.py)", path.c_str());
+         f.read(reinterpret_cast<char*>(mi->base), std::streamsize(image));
+         if (uint64_t(f.gcount()) != image) fatal("%s: expected %llx bytes", path.c_str(), (unsigned long long)image);
+diff --git a/runtime/src/platform_win.cpp b/runtime/src/platform_win.cpp
+index 28718bd..9d8d47e 100644
+--- a/runtime/src/platform_win.cpp
++++ b/runtime/src/platform_win.cpp
+@@ -185,8 +185,19 @@ bool make_dirs(const std::string& path) {
+ void log_line(const char* line) { std::fprintf(stderr, "%s\n", line); }
+ 
+ std::string data_root() {
+-    const char* r = std::getenv("NX_DATA_ROOT");
+-    return r ? r : nx::game::kInfo.pc_data_root;
++    // The launcher selects a Unicode Windows folder. Keep the runtime's path API UTF-8.
++    static const std::string root=[] {
++        const DWORD count=GetEnvironmentVariableW(L"NX_DATA_ROOT",nullptr,0);
++        if(!count)return std::string(nx::game::kInfo.pc_data_root);
++        std::wstring value(size_t(count),L'\0');
++        if(!GetEnvironmentVariableW(L"NX_DATA_ROOT",value.data(),count))return std::string(nx::game::kInfo.pc_data_root);
++        value.resize(std::wcslen(value.c_str()));
++        const int size=WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,value.data(),int(value.size()),nullptr,0,nullptr,nullptr);
++        std::string utf8(size_t(size>0?size:0),'\0');
++        if(size>0)WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,value.data(),int(value.size()),utf8.data(),size,nullptr,nullptr);
++        return utf8;
++    }();
++    return root;
+ }
+ 
+ std::string setting(const std::string& key) {
+diff --git a/runtime/src/ui/i18n.cpp b/runtime/src/ui/i18n.cpp
+index c017965..e06747d 100644
+--- a/runtime/src/ui/i18n.cpp
++++ b/runtime/src/ui/i18n.cpp
+@@ -35,13 +35,14 @@ struct Entry {
+ const Entry kEn[] = {
+     {"app.title", "Settings"},
+     {"app.subtitle", "ACNHRecomp"},
+-    {"app.hint_open", "Press F1 or Minus + Plus to open the settings"},
++    {"app.hint_open", "F1: Settings   F2: Bells menu"},
+     {"tab.game", "Game"},
+     {"tab.video", "Video"},
+     {"tab.audio", "Audio"},
+     {"tab.controls", "Controls"},
+     {"tab.saves", "Saves"},
+     {"tab.about", "About"},
++    {"tab.bells", "Mod Menu"},
+     {"common.on", "On"},
+     {"common.off", "Off"},
+     {"common.auto", "Automatic"},
+diff --git a/runtime/src/ui/settings.cpp b/runtime/src/ui/settings.cpp
+index c3165d1..b27f88e 100644
+--- a/runtime/src/ui/settings.cpp
++++ b/runtime/src/ui/settings.cpp
+@@ -13,6 +13,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <cmath>
++#include <cctype>
+ #include <cstdio>
+ #include <cstring>
+ #include <filesystem>
+@@ -35,6 +36,10 @@
+ #include "ui/i18n.h"
+ #include "ui/theme.h"
+ #include "ui/ui_internal.h"
++#include "bells_menu.h"
++#include "bells_codec.h"
++#include "item_catalog.h"
++#include "visitor_menu.h"
+ 
+ namespace nx::nvn {
+ float uw_factor();      // nvn_ultrawide.cpp: the picture's aspect over 16:9
+@@ -57,10 +62,15 @@ struct Page {
+ const Page kPages[] = {
+     {"tab.game", rgb(124, 194, 103), 0},  {"tab.video", rgb(79, 179, 217), 1},   {"tab.audio", rgb(245, 166, 35), 2},
+     {"tab.controls", rgb(155, 125, 212), 3}, {"tab.saves", rgb(232, 115, 122), 4}, {"tab.about", rgb(176, 140, 100), 5},
++    {"tab.bells", rgb(245, 192, 65), 0},
+ };
+ constexpr int kPageCount = int(sizeof(kPages) / sizeof(kPages[0]));
+ 
+ int g_page = 0;
++std::atomic<bool> g_request_bells{false};
++std::atomic<int> g_request_currency{-1};
++int g_currency = 0;
++int g_mod_section = 0;
+ float g_scale = 1;
+ std::string g_toast;
+ double g_toast_until = 0;
+@@ -864,10 +874,228 @@ void bumper_label(ImDrawList* dl, ImVec2 p, ImVec2 size, const std::string& labe
+ 
+ bool g_quit_confirm = false;
+ 
++void page_items(const bells::Player& player,bool busy) {
++    static char search[128]{};
++    static uint16_t selected=0xffff;
++    static int quantity=1,variant=0,category=0;
++    const auto& entries=items::catalog();
++    if(entries.empty()) {ImGui::TextWrapped("%s",items::catalog_error().c_str());return;}
++    if(selected==0xffff)selected=entries.front().id;
++    const float item_gap=ImGui::GetStyle().ItemSpacing.x;
++    const float full_width=ImGui::GetContentRegionAvail().x;
++    ImGui::SetNextItemWidth(full_width*0.62f);
++    ImGui::InputTextWithHint("##item-search","Search item name or ID...",search,sizeof search);
++    static std::vector<std::string> categories=[] {
++        std::vector<std::string> out{"All categories"};
++        for(const auto& e:items::catalog()) if(std::find(out.begin(),out.end(),e.category)==out.end())out.push_back(e.category);
++        std::sort(out.begin()+1,out.end());return out;
++    }();
++    ImGui::SameLine();ImGui::SetNextItemWidth(-1);
++    if(ImGui::BeginCombo("##item-category",categories[category].c_str())) {
++        for(size_t i=0;i<categories.size();++i)if(ImGui::Selectable(categories[i].c_str(),category==int(i)))category=int(i);
++        ImGui::EndCombo();
++    }
++    std::string query=search;
++    std::transform(query.begin(),query.end(),query.begin(),[](unsigned char c){return char(std::tolower(c));});
++    std::vector<const items::Entry*> filtered;
++    for(const auto& e:entries) {
++        if(category && e.category!=categories[category])continue;
++        std::string name=e.name;std::transform(name.begin(),name.end(),name.begin(),[](unsigned char c){return char(std::tolower(c));});
++        if(!query.empty() && name.find(query)==std::string::npos && std::to_string(e.id).find(query)==std::string::npos)continue;
++        filtered.push_back(&e);
++    }
++    ImGui::Text("%zu matching / %zu items",filtered.size(),entries.size());
++    if(ImGui::BeginChild("item-list",ImVec2(full_width*0.54f,240*g_scale),ImGuiChildFlags_Borders)) {
++        ImGuiListClipper clipper;clipper.Begin(int(filtered.size()));
++        while(clipper.Step())for(int i=clipper.DisplayStart;i<clipper.DisplayEnd;++i) {
++            const auto& e=*filtered[i];const std::string label=e.name+"  (#"+std::to_string(e.id)+")";
++            ImGui::PushID(e.id);
++            if(ImGui::Selectable(label.c_str(),selected==e.id)) {selected=e.id;quantity=1;variant=0;}
++            ImGui::PopID();
++        }
++    }ImGui::EndChild();ImGui::SameLine(0,item_gap);ImGui::BeginGroup();
++    ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x);
++    const auto* item=items::find(selected);
++    if(!item) {ImGui::TextWrapped("Select an item from the list.");ImGui::PopItemWidth();ImGui::EndGroup();return;}
++    ImGui::TextWrapped("%s",item->name.c_str());
++    if(item->variants.size()>1) {
++        variant=std::clamp(variant,0,int(item->variants.size())-1);
++        ImGui::SetNextItemWidth(-1);
++        if(ImGui::BeginCombo("##item-variant",item->variants[variant].name.c_str())) {
++            for(size_t i=0;i<item->variants.size();++i) if(ImGui::Selectable(item->variants[i].name.c_str(),variant==int(i)))variant=int(i);
++            ImGui::EndCombo();
++        }
++    }
++    quantity=std::clamp(quantity,1,int(item->max_stack));
++    if(item->max_stack>1) {ImGui::SetNextItemWidth(-1);ImGui::SliderInt("##item-count",&quantity,1,item->max_stack,"Quantity: %d");}
++    if(item->category=="Turnips" && item->max_stack>1)ImGui::TextWrapped("Each quantity unit is 10 turnips.");
++    ImGui::BeginDisabled(busy);
++    if(ImGui::Button("Give to empty pocket slot",ImVec2(-1,36*g_scale))) {
++        std::string message;if(!bells::request_item(player.key,item->id,unsigned(quantity),unsigned(variant),message))toast(message);
++    }
++    ImGui::EndDisabled();
++    ImGui::TextWrapped("Close pockets before giving, then reopen them. Save normally to keep items.");
++    ImGui::PopItemWidth();ImGui::EndGroup();
++}
++
++void page_tools(const bells::Player& player,bool busy) {
++    unsigned tools=0;
++    for(unsigned i=0;i<player.pocket_count;++i) {
++        const auto* e=items::find(uint16_t(player.items[i]));if(e && e->tool)++tools;
++    }
++    ImGui::Text("Tools in pockets: %u",tools);
++    ImGui::TextWrapped("Close pockets and put away your held tool before making changes.");
++    ImGui::BeginDisabled(busy);
++    const char* labels[]={"Repair pocket tools","Upgrade tools one tier","Upgrade to golden tools"};
++    for(int i=0;i<3;++i) if(ImGui::Button(labels[i],ImVec2(-1,40*g_scale))) {
++        std::string message;if(!bells::request_tools(player.key,static_cast<bells::ToolAction>(i),message))toast(message);
++    }
++    ImGui::EndDisabled();
++    ImGui::TextWrapped("Upgrades apply to tools you already carry. Tools without a higher tier stay as they are.");
++}
++
++void page_visitors(const bells::Player& player,bool busy) {
++    static std::string island;
++    static int day=-1,visitor=0;
++    auto state=visitors::state();
++    if(island!=player.key) {island=player.key;visitors::scan(player.key);state=visitors::state();day=state.today;}
++    if(day<0)day=state.today;
++    ImGui::BeginDisabled(state.scanning||state.pending);
++    if(ImGui::Button(state.scanning ? "Finding visitors..." : "Refresh visitor schedule",ImVec2(-1,32*g_scale)))visitors::scan(player.key);
++    ImGui::EndDisabled();
++    ImGui::TextWrapped("%s",state.message.c_str());
++    if(!state.copies)return;
++    constexpr visitors::Visitor choices[]={visitors::Visitor::Redd,visitors::Visitor::Celeste,visitors::Visitor::CJ,
++        visitors::Visitor::Flick,visitors::Visitor::Leif,visitors::Visitor::Saharah,visitors::Visitor::Kicks,
++        visitors::Visitor::Gulliver,visitors::Visitor::Gullivarrr,visitors::Visitor::Label,visitors::Visitor::Mabel,visitors::Visitor::Wisp,visitors::Visitor::None};
++    ImGui::SetNextItemWidth(-1);
++    if(ImGui::BeginCombo("##visitor",visitors::visitor_name(choices[visitor]))) {
++        for(size_t i=0;i<std::size(choices);++i)if(ImGui::Selectable(visitors::visitor_name(choices[i]),visitor==int(i)))visitor=int(i);
++        ImGui::EndCombo();
++    }
++    ImGui::SetNextItemWidth(-1);
++    if(ImGui::BeginCombo("##visit-day",visitors::day_name(day))) {
++        for(int i=0;i<7;++i) {
++            const std::string label=std::string(visitors::day_name(i))+(i==state.today ? " (today)" : "");
++            if(ImGui::Selectable(label.c_str(),day==i))day=i;
++        }ImGui::EndCombo();
++    }
++    ImGui::BeginDisabled(busy||state.scanning||state.pending);
++    if(ImGui::Button("Schedule visit",ImVec2(-1,36*g_scale))) {
++        std::string message;if(!visitors::request_schedule(player.key,choices[visitor],day,message))toast(message);
++    }
++    const bool special=choices[visitor]==visitors::Visitor::Celeste||choices[visitor]==visitors::Visitor::Wisp;
++    if(special && ImGui::Button("Remove this week's special visit",ImVec2(-1,30*g_scale))) {
++        std::string message;if(!visitors::request_schedule(player.key,choices[visitor],-1,message))toast(message);
++    }
++    ImGui::EndDisabled();
++    ImGui::TextWrapped("Save, return to the title screen, then load your island again. Celeste visits at night (7 pm-4 am). Story unlocks, weather and holiday rules still apply.");
++    if(ImGui::BeginTable("visitor-week",2,ImGuiTableFlags_RowBg)) {
++        for(int i=0;i<7;++i){ImGui::TableNextRow();ImGui::TableNextColumn();ImGui::Text("%s%s",visitors::day_name(i),i==state.today ? " *" : "");ImGui::TableNextColumn();ImGui::TextUnformatted(visitors::visitor_name(static_cast<visitors::Visitor>(state.daily[i])));}
++        ImGui::EndTable();
++    }
++    ImGui::Text("Celeste: %s   |   Wisp: %s",visitors::day_name(state.celeste_day),visitors::day_name(state.wisp_day));
++}
++
++void page_bells() {
++    static bool started = false;
++    static std::string selected;
++    auto state = bells::state();
++    if (!state.supported) {
++        ImGui::TextWrapped("This menu supports ACNH 3.0.2 on Windows. Your game folder must match that version.");
++        return;
++    }
++    if (!started) { bells::scan(); started=true; state=bells::state(); }
++    ImGui::BeginDisabled(state.scanning || state.pending);
++    if (ImGui::Button(state.scanning ? "Finding player..." : "Find / refresh player",ImVec2(0,30*g_scale))) bells::scan();
++    ImGui::EndDisabled();
++    ImGui::SameLine();ImGui::TextUnformatted("F2: open / close");
++    ImGui::TextWrapped("%s",state.message.c_str());
++    if (state.players.empty()) return;
++    if (std::none_of(state.players.begin(),state.players.end(),[&](const bells::Player& p){return p.key==selected;}))
++        selected=state.players.front().key;
++    const bells::Player* chosen=nullptr;
++    for (const auto& player:state.players) {
++        const std::string label=player.name+"  -  "+player.island;
++        if(state.players.size()>1) {if (ImGui::RadioButton(label.c_str(),selected==player.key)) selected=player.key;}
++        else ImGui::TextUnformatted(label.c_str());
++        if(selected==player.key) chosen=&player;
++    }
++    if(!chosen)return;
++    const char* sections[]={"Currency","Items","Tools","Visitors"};
++    const float section_gap=ImGui::GetStyle().ItemSpacing.x;
++    const float section_width=(ImGui::GetContentRegionAvail().x-3*section_gap)/4;
++    for(int i=0;i<4;++i) {
++        if(i)ImGui::SameLine();
++        ImGui::PushStyleColor(ImGuiCol_Button,i==g_mod_section ? rgb(245,192,65) : rgb(242,233,210));
++        if(ImGui::Button(sections[i],ImVec2(section_width,34*g_scale)))g_mod_section=i;
++        ImGui::PopStyleColor();
++    }
++    ImGui::Spacing();
++    if(g_mod_section==1) {page_items(*chosen,state.scanning||state.pending);return;}
++    if(g_mod_section==2) {page_tools(*chosen,state.scanning||state.pending);return;}
++    if(g_mod_section==3) {page_visitors(*chosen,state.scanning||state.pending);return;}
++    const char* modes[]={"Wallet","ABD Bank","Nook Miles"};
++    const float gap=ImGui::GetStyle().ItemSpacing.x;
++    const float mode_width=(ImGui::GetContentRegionAvail().x-2*gap)/3;
++    for(int mode=0;mode<3;++mode) {
++        if(mode) ImGui::SameLine();
++        ImGui::PushStyleColor(ImGuiCol_Button,mode==g_currency ? rgb(245,192,65) : rgb(242,233,210));
++        if(ImGui::Button(modes[mode],ImVec2(mode_width,36*g_scale))) g_currency=mode;
++        ImGui::PopStyleColor();
++    }
++    if(!chosen) return;
++    const auto currency=static_cast<bells::Currency>(g_currency);
++    const uint32_t balance=currency==bells::Currency::Wallet ? chosen->wallet
++        : currency==bells::Currency::Bank ? chosen->bank : chosen->miles;
++    ImGui::Text("%s: %s %s",bells::currency_name(currency),bells::format_amount(balance).c_str(),currency==bells::Currency::Miles ? "Miles" : "Bells");
++    ImGui::Separator();
++    ImGui::Spacing();
++    ImGui::BeginDisabled(state.scanning || state.pending || (currency==bells::Currency::Miles && !chosen->miles_ready));
++    ImGui::PushID(g_currency);
++    const float width=(ImGui::GetContentRegionAvail().x-gap)/2;
++    auto add_button=[&](uint32_t amount) {
++        const std::string label="Add "+bells::format_amount(amount);
++        if(ImGui::Button(label.c_str(),ImVec2(width,42*g_scale))) {
++            std::string message;
++            if(!bells::request_grant(selected,currency,amount,false,message)) toast(message);
++        }
++    };
++    if(currency==bells::Currency::Wallet) {
++        add_button(10000);
++        ImGui::SameLine();
++        if(ImGui::Button("Fill wallet (99,999)",ImVec2(width,42*g_scale))) {
++            std::string message;
++            if(!bells::request_grant(selected,currency,0,true,message)) toast(message);
++        }
++    } else {
++        add_button(100);ImGui::SameLine();add_button(1000);
++        add_button(100000);
++        if(currency==bells::Currency::Bank) {ImGui::SameLine();add_button(100000000);}
++    }
++    ImGui::PopID();
++    ImGui::EndDisabled();
++    ImGui::Spacing();
++    if(currency==bells::Currency::Miles && !chosen->miles_ready) ImGui::TextWrapped("Enter your island, then refresh the player to load Nook Miles.");
++    else ImGui::TextWrapped("Each amount adds to the selected balance. Save normally to keep it.");
++}
++
+ }  // namespace
+ 
++void settings_request_bells(int currency) {
++    if(currency>=0 && currency<6) g_request_currency=currency;
++    g_request_bells=true;
++}
++
+ bool settings_draw(float scale, ImFont* title) {
+     g_scale = scale;
++    if (g_request_bells.exchange(false)) {
++        g_page=6;
++        const int currency=g_request_currency.exchange(-1);
++        if(currency>=0 && currency<3) {g_currency=currency;g_mod_section=0;}
++        if(currency>=3 && currency<6)g_mod_section=currency-2;
++        bells::scan();
++    }
+     static const bool cycle = std::getenv("NX_UI_CYCLE") != nullptr;  // tests: every page in turn, 10 s each
+     if (cycle) g_page = int(double(plat::monotonic_ns()) / 1e10) % kPageCount;
+     static const char* page = std::getenv("NX_UI_PAGE");  // tests: that page (0 game, 1 video, ...) when opened
+@@ -1009,7 +1237,7 @@ bool settings_draw(float scale, ImFont* title) {
+         if (portrait && k) ImGui::SameLine();
+         ImGui::PushID(k);
+         const char* label = tr(kPages[k].key);
+-        float bh = 52.0f * scale;
++        float bh = 44.0f * scale;
+         float bw = portrait ? std::max(140.0f * scale, ImGui::CalcTextSize(label).x + bh + 24 * scale) : -1;
+         ImVec2 p = ImGui::GetCursorScreenPos();
+         bool sel = g_page == k;
+@@ -1058,7 +1286,8 @@ bool settings_draw(float scale, ImFont* title) {
+         case 2: page_audio(); break;
+         case 3: page_controls(); break;
+         case 4: page_saves(); break;
+-        default: page_about(); break;
++        case 5: page_about(); break;
++        default: page_bells(); break;
+     }
+     // Tests: NX_UI_SCROLL=<0..1> scrolls the page that far down (headless dumps show the rows further down).
+     if (static const char* sc = std::getenv("NX_UI_SCROLL"); sc && ImGui::GetScrollMaxY() > 0)
+diff --git a/runtime/src/ui/settings.h b/runtime/src/ui/settings.h
+index 06445f4..f82d2b3 100644
+--- a/runtime/src/ui/settings.h
++++ b/runtime/src/ui/settings.h
+@@ -6,6 +6,7 @@ struct ImFont;
+ namespace nx::ui {
+ 
+ bool settings_draw(float scale, ImFont* title);  // false once the player closed the screen
++void settings_request_bells(int currency=-1);
+ void settings_hint(float scale, float t);           // the "F1: settings" hint, t seconds into its showing (< 0: not yet)
+ 
+ }  // namespace nx::ui
+diff --git a/runtime/src/ui/ui.cpp b/runtime/src/ui/ui.cpp
+index ed32018..843b5df 100644
+--- a/runtime/src/ui/ui.cpp
++++ b/runtime/src/ui/ui.cpp
+@@ -35,6 +35,11 @@
+ #include "ui/settings.h"
+ #include "ui/theme.h"
+ #include "ui/ui_internal.h"
++#ifdef NX_BELLS_TEST_BRIDGE
++#include "bells_menu.h"
++#include "visitor_menu.h"
++#include <fstream>
++#endif
+ 
+ namespace nx::ui {
+ 
+@@ -385,6 +390,64 @@ void rotate_draw_data(ImDrawData* dd, int r, float uw, float uh) {
+ void ui_record(VkCommandBuffer cb, VkImage image, VkFormat format, VkExtent2D extent) {
+     static bool open_checked = false;  // NX_UI_OPEN read here too: Android sets config.txt's variables after static init
+     if (!open_checked) open_checked = true, g_visible = g_visible || std::getenv("NX_UI_OPEN") != nullptr;
++#ifdef NX_BELLS_TEST_BRIDGE
++    // Compiled out of the delivered player. Drives the same menu callbacks against the isolated test save.
++    if (std::getenv("NX_BELLS_TEST_ENABLE")) {
++        const std::string path=plat::data_root()+"/bells-menu-test.command";
++        std::ifstream input(path);
++        std::string command;
++        if (std::getline(input,command)) {
++            input.close();
++            std::remove(path.c_str());
++            if (command=="f2") {
++                SDL_Event event{};
++                event.type=SDL_EVENT_KEY_DOWN;
++                event.key.scancode=SDL_SCANCODE_F2;
++                ui_event(event);
++            } else if (command=="scan") bells::scan();
++            else if(command=="bank" || command=="miles" || command=="wallet" || command=="items" || command=="tools" || command=="visitors") {
++                settings_request_bells(command=="bank" ? 1 : command=="miles" ? 2 : command=="items" ? 3 : command=="tools" ? 4 : command=="visitors" ? 5 : 0);
++                g_visible=true;
++            }
++            else if (command=="a") hid_hold_buttons(plat::kA,6);
++            else if (command=="b") hid_hold_buttons(plat::kB,6);
++            else if (command=="pockets") hid_hold_buttons(plat::kX,6);
++            else if (command=="minus") hid_hold_buttons(plat::kMinus,6);
++            else if (command=="add" || command=="fill") {
++                const auto state=bells::state();
++                std::string message="Test requires exactly one loaded character.";
++                if (state.players.size()==1) bells::request_grant(state.players.front().key,bells::Currency::Wallet,10000,command=="fill",message);
++                log("bells menu test: %s",message.c_str());
++            } else if(command=="visitor-scan") {
++                const auto state=bells::state();if(state.players.size()==1)visitors::scan(state.players.front().key);
++            } else if(command.rfind("visitor:",0)==0) {
++                const auto state=bells::state();std::string message="Test requires one player.";int id=0,day=0;
++                if(state.players.size()==1 && std::sscanf(command.c_str(),"visitor:%d:%d",&id,&day)==2)
++                    visitors::request_schedule(state.players.front().key,static_cast<visitors::Visitor>(id),day,message);
++                log("visitors menu test: %s",message.c_str());
++            } else if(command.rfind("item:",0)==0 || command.rfind("tool:",0)==0) {
++                const auto state=bells::state();std::string message="Test requires one player.";
++                if(state.players.size()==1) {
++                    unsigned id=0,count=1,variant=0;
++                    if(command.rfind("item:",0)==0 && std::sscanf(command.c_str(),"item:%u:%u:%u",&id,&count,&variant)>=1)
++                        bells::request_item(state.players.front().key,uint16_t(id),count,variant,message);
++                    else if(command=="tool:repair")bells::request_tools(state.players.front().key,bells::ToolAction::Repair,message);
++                    else if(command=="tool:upgrade")bells::request_tools(state.players.front().key,bells::ToolAction::Upgrade,message);
++                    else if(command=="tool:golden")bells::request_tools(state.players.front().key,bells::ToolAction::Golden,message);
++                }
++                log("mod menu test: %s",message.c_str());
++            } else if(command.rfind("bank:",0)==0 || command.rfind("miles:",0)==0) {
++                const bool bank=command.rfind("bank:",0)==0;
++                const uint32_t amount=uint32_t(std::strtoul(command.c_str()+(bank?5:6),nullptr,10));
++                const auto state=bells::state();
++                std::string message="Test requires exactly one loaded character.";
++                if(state.players.size()==1) bells::request_grant(state.players.front().key,bank?bells::Currency::Bank:bells::Currency::Miles,amount,false,message);
++                log("bells menu test: %s",message.c_str());
++            }
++            log("bells menu test command: %s (visible=%d)",command.c_str(),int(g_visible.load()));
++        }
++    }
++#endif
+     const int quarter = g_quarter.load();
+     const bool sideways = quarter == 1 || quarter == 3;
+     const float up_w = float(sideways ? extent.height : extent.width), up_h = float(sideways ? extent.width : extent.height);
+@@ -506,6 +569,11 @@ void ui_event(const SDL_Event& e) {
+                 ui_toggle();
+                 return;
+             }
++            if (down && !e.key.repeat && e.key.scancode == SDL_SCANCODE_F2) {
++                settings_request_bells();
++                ui_toggle();
++                return;
++            }
+             if (!g_visible) return;
+             if (ImGuiKey k = imgui_key(e.key.scancode); k != ImGuiKey_None) push({Input::Key, k, down});
+             Input mod{Input::Key, ImGuiMod_Ctrl, (e.key.mod & SDL_KMOD_CTRL) != 0};
